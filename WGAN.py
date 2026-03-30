@@ -16,10 +16,9 @@
 import os
 import random
 import warnings
-
-# Suppress PIL palette image warnings (cosmetic only, not an error)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -48,55 +47,52 @@ print(f"Using device: {device}")
 # 2. HYPERPARAMETERS
 # =============================================================================
 
-Z_DIM        = 100          # Latent vector dimension
-IMG_SIZE     = 128          # Spatial resolution (128x128)
-IMG_CHANNELS = 3            # RGB
-FEATURES_G   = 64           # Base feature map count for Generator
-FEATURES_D   = 64           # Base feature map count for Critic
+Z_DIM        = 100
+IMG_SIZE     = 128
+IMG_CHANNELS = 3
+FEATURES_G   = 64
+FEATURES_D   = 64       # Keep at 64 — matches the run that gave separation 12.7
 
-LR_G         = 1e-4         # Generator learning rate
-LR_D         = 4e-5         # Critic learning rate (TTUR — slightly slower)
-BETAS        = (0.0, 0.9)   # Adam betas — β1=0 recommended for WGAN-GP
+LR_G         = 1e-4
+LR_D         = 4e-5     # Slightly slower critic LR (TTUR) — same as 12.7 run
+BETAS        = (0.0, 0.9)
 
 BATCH_SIZE   = 64
-NUM_EPOCHS   = 200          # More epochs → better separation score
-CRITIC_ITERS = 7            # Critic updates per generator update (increased from 3)
-LAMBDA_GP    = 10           # Gradient penalty coefficient
-SAVE_EVERY   = 5            # Save generated samples every N epochs
+NUM_EPOCHS   = 200      # 200 was enough for 12.7 — no need for 300
+CRITIC_ITERS = 7        # 7 gave better separation than 5
+LAMBDA_GP    = 10
+SAVE_EVERY   = 5
 NUM_WORKERS  = 6
-
-# Evaluation split: hold out 10% of real images for clean eval
 EVAL_SPLIT   = 0.10
 
 # =============================================================================
 # 3. DATASET
-#
-# Folder structure:
-#   GAN/
-#     Real_9/
-#       aloo_gobi/    ← subfolders required by ImageFolder
-#       aloo_methi/
-#       ...
-#
-# Labels from ImageFolder are IGNORED — GAN only uses raw pixel values.
-#
-# Images are converted to RGB to handle any palette/transparency edge cases.
 # =============================================================================
 
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.CenterCrop(IMG_SIZE),
-    transforms.Lambda(lambda img: img.convert("RGB")),  # Fix palette/RGBA warnings
+    transforms.Lambda(lambda img: img.convert("RGB")),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.5, 0.5, 0.5],  # Normalise to [-1, 1]
-        std=[0.5, 0.5, 0.5]
-    )
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
+
+# Only use the 5 selected classes — create Real_5 folder with just these
+# OR use the subset approach below which filters from Real_9 directly
+SELECTED_CLASSES = ["aloo_gobi", "aloo_methi", "aloo_mutter", "palak_paneer", "poha"]
 
 full_dataset = datasets.ImageFolder(root="./Real_9", transform=transform)
 
-# Split into train and eval subsets for clean evaluation
+# Filter dataset to only selected 5 classes
+selected_indices = [
+    i for i, (_, label) in enumerate(full_dataset.samples)
+    if full_dataset.classes[label] in SELECTED_CLASSES
+]
+full_dataset = torch.utils.data.Subset(full_dataset, selected_indices)
+
+# Patch .classes onto Subset for printing
+full_dataset.classes = SELECTED_CLASSES
+
 eval_size  = int(len(full_dataset) * EVAL_SPLIT)
 train_size = len(full_dataset) - eval_size
 train_dataset, eval_dataset = random_split(
@@ -106,34 +102,21 @@ train_dataset, eval_dataset = random_split(
 )
 
 loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=True  # Full batches only — required for stable gradient penalty
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=True, drop_last=True
 )
-
 eval_loader = DataLoader(
-    eval_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=True
+    eval_dataset, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, pin_memory=True, drop_last=True
 )
 
 print(f"Total images    : {len(full_dataset)}")
 print(f"Training images : {train_size}")
 print(f"Eval images     : {eval_size}")
-print(f"Classes         : {full_dataset.classes}")
+print(f"Classes         : {SELECTED_CLASSES}")
 
 # =============================================================================
 # 4. GENERATOR
-#
-# z (Z_DIM x 1 x 1) → ConvTranspose2d blocks → 3 x 128 x 128
-#
-# Spatial progression: 1 → 4 → 8 → 16 → 32 → 64 → 128
 # =============================================================================
 
 class Generator(nn.Module):
@@ -148,25 +131,21 @@ class Generator(nn.Module):
             )
 
         self.net = nn.Sequential(
-            # Stem: z_dim x 1 x 1 → features_g*16 x 4 x 4
-            nn.ConvTranspose2d(z_dim, features_g * 16, kernel_size=4, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(features_g * 16),
+            nn.ConvTranspose2d(z_dim, features_g*16, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(features_g*16),
             nn.ReLU(inplace=True),
 
-            up_block(features_g * 16, features_g * 8),  # → 8 x 8
-            up_block(features_g * 8,  features_g * 4),  # → 16 x 16
-            up_block(features_g * 4,  features_g * 2),  # → 32 x 32
-            up_block(features_g * 2,  features_g),      # → 64 x 64
+            up_block(features_g*16, features_g*8),
+            up_block(features_g*8,  features_g*4),
+            up_block(features_g*4,  features_g*2),
+            up_block(features_g*2,  features_g),
 
-            # Output layer: no BatchNorm, Tanh activation
             nn.ConvTranspose2d(features_g, img_channels, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.Tanh()  # Output in [-1, 1] to match normalised real images
+            nn.Tanh()
         )
-
         self._init_weights()
 
     def _init_weights(self):
-        """DCGAN-style weight init: N(0, 0.02)"""
         for m in self.modules():
             if isinstance(m, (nn.ConvTranspose2d, nn.BatchNorm2d)):
                 nn.init.normal_(m.weight, 0.0, 0.02)
@@ -177,18 +156,7 @@ class Generator(nn.Module):
         return self.net(z)
 
 # =============================================================================
-# 5. CRITIC (DISCRIMINATOR)
-#
-# Input : 3 x 128 x 128
-# Output: scalar Wasserstein score — NO Sigmoid
-#
-# Design:
-#   - Spectral Normalisation on ALL Conv layers (Lipschitz constraint)
-#   - NO BatchNorm (incompatible with gradient penalty)
-#   - LeakyReLU(0.2) throughout
-#   - Deeper than generator for stronger discriminative power
-#
-# Spatial progression: 128 → 64 → 32 → 16 → 8 → 4 → 1
+# 5. CRITIC
 # =============================================================================
 
 class Critic(nn.Module):
@@ -196,7 +164,6 @@ class Critic(nn.Module):
         super(Critic, self).__init__()
 
         def sn_conv(in_c, out_c, kernel=4, stride=2, pad=1):
-            """Strided Conv with Spectral Norm + LeakyReLU"""
             return nn.Sequential(
                 nn.utils.spectral_norm(
                     nn.Conv2d(in_c, out_c, kernel_size=kernel, stride=stride, padding=pad, bias=False)
@@ -205,40 +172,26 @@ class Critic(nn.Module):
             )
 
         self.net = nn.Sequential(
-            # 3 x 128 x 128 → fd x 64 x 64
             sn_conv(img_channels,   features_d),
+            sn_conv(features_d,     features_d*2),
+            sn_conv(features_d*2,   features_d*4),
+            sn_conv(features_d*4,   features_d*8),
+            sn_conv(features_d*8,   features_d*16),
 
-            # fd x 64 → fd*2 x 32
-            sn_conv(features_d,     features_d * 2),
-
-            # fd*2 x 32 → fd*4 x 16
-            sn_conv(features_d * 2, features_d * 4),
-
-            # fd*4 x 16 → fd*8 x 8
-            sn_conv(features_d * 4, features_d * 8),
-
-            # fd*8 x 8 → fd*16 x 4  (deepest downsampling)
-            sn_conv(features_d * 8, features_d * 16),
-
-            # Extra conv at 4x4 — increases depth without changing spatial size
             nn.utils.spectral_norm(
-                nn.Conv2d(features_d * 16, features_d * 16, kernel_size=3, stride=1, padding=1, bias=False)
+                nn.Conv2d(features_d*16, features_d*16, kernel_size=3, stride=1, padding=1, bias=False)
             ),
             nn.LeakyReLU(0.2, inplace=True),
 
-            # Another extra conv — stronger feature extraction
             nn.utils.spectral_norm(
-                nn.Conv2d(features_d * 16, features_d * 8, kernel_size=3, stride=1, padding=1, bias=False)
+                nn.Conv2d(features_d*16, features_d*8, kernel_size=3, stride=1, padding=1, bias=False)
             ),
             nn.LeakyReLU(0.2, inplace=True),
 
-            # Final: fd*8 x 4 x 4 → 1 x 1 x 1
             nn.utils.spectral_norm(
-                nn.Conv2d(features_d * 8, 1, kernel_size=4, stride=1, padding=0, bias=False)
+                nn.Conv2d(features_d*8, 1, kernel_size=4, stride=1, padding=0, bias=False)
             )
-            # NO Sigmoid — raw scalar score for Wasserstein loss
         )
-
         self._init_weights()
 
     def _init_weights(self):
@@ -247,44 +200,29 @@ class Critic(nn.Module):
                 nn.init.normal_(m.weight, 0.0, 0.02)
 
     def forward(self, x):
-        out = self.net(x)
-        return out.view(out.size(0), 1)  # Shape: (batch_size, 1)
+        return self.net(x).view(x.size(0), 1)
 
 # =============================================================================
 # 6. GRADIENT PENALTY
-#
-# Creates interpolated samples between real and fake, computes critic score,
-# then penalises gradients that deviate from unit norm.
-#
-# GP = E[ (||∇D(x̂)||₂ - 1)² ]   where  x̂ = ε·real + (1-ε)·fake
 # =============================================================================
 
 def gradient_penalty(critic, real, fake):
-    batch_size = real.size(0)
-
-    # ε ∈ [0,1] sampled per image in the batch
-    epsilon = torch.rand(batch_size, 1, 1, 1, device=device)
-
-    # Interpolated images between real and fake manifolds
+    batch_size   = real.size(0)
+    epsilon      = torch.rand(batch_size, 1, 1, 1, device=device)
     interpolated = (epsilon * real + (1.0 - epsilon) * fake).requires_grad_(True)
-
-    # Critic score at interpolated points
     mixed_scores = critic(interpolated)
 
-    # Gradients of critic output w.r.t. interpolated inputs
     gradients = torch.autograd.grad(
         outputs=mixed_scores,
         inputs=interpolated,
         grad_outputs=torch.ones_like(mixed_scores),
-        create_graph=True,   # Must be True — GP itself needs to be differentiated
+        create_graph=True,
         retain_graph=True
     )[0]
 
-    # L2 norm per sample, then penalise deviation from 1
-    gradients  = gradients.view(batch_size, -1)
-    grad_norm  = gradients.norm(2, dim=1)
-    gp         = torch.mean((grad_norm - 1.0) ** 2)
-    return gp
+    gradients = gradients.view(batch_size, -1)
+    grad_norm = gradients.norm(2, dim=1)
+    return torch.mean((grad_norm - 1.0) ** 2)
 
 # =============================================================================
 # 7. MODEL + OPTIMISER SETUP
@@ -301,19 +239,18 @@ n_critic = sum(p.numel() for p in critic.parameters() if p.requires_grad)
 print(f"\nGenerator params : {n_gen:,}")
 print(f"Critic params    : {n_critic:,}")
 
-os.makedirs("generated", exist_ok=True)
+os.makedirs("generated",    exist_ok=True)
+os.makedirs("saved_models", exist_ok=True)
 
-# Fixed noise vector — same 16 seeds every save for consistent visual comparison
+# Initialise loss log CSV — so results are never lost even if terminal closes
+LOSS_LOG = "loss_log.csv"
+with open(LOSS_LOG, "w", newline="") as f:
+    csv.writer(f).writerow(["epoch", "critic_loss", "gen_loss"])
+
 fixed_noise = torch.randn(16, Z_DIM, 1, 1, device=device)
 
 # =============================================================================
 # 8. TRAINING LOOP
-#
-# Each iteration:
-#   1. Train critic CRITIC_ITERS times with gradient penalty
-#   2. Train generator once
-#   3. Log losses every epoch
-#   4. Save sample grid every SAVE_EVERY epochs
 # =============================================================================
 
 print("\nStarting training...\n")
@@ -327,32 +264,20 @@ for epoch in range(1, NUM_EPOCHS + 1):
         real      = real.to(device)
         cur_batch = real.size(0)
 
-        # ------------------------------------------------------------------
-        # Step 1: Train Critic
-        #
-        # Critic loss = E[D(fake)] - E[D(real)] + λ·GP
-        # Minimising this → maximises Wasserstein distance estimate
-        # ------------------------------------------------------------------
+        # ---- Train Critic ----
         for _ in range(CRITIC_ITERS):
-            noise = torch.randn(cur_batch, Z_DIM, 1, 1, device=device)
-            fake  = gen(noise).detach()  # Detach: skip generator graph
-
+            noise      = torch.randn(cur_batch, Z_DIM, 1, 1, device=device)
+            fake       = gen(noise).detach()
             score_real = critic(real)
             score_fake = critic(fake)
             gp         = gradient_penalty(critic, real, fake)
-
             loss_critic = torch.mean(score_fake) - torch.mean(score_real) + LAMBDA_GP * gp
 
             opt_critic.zero_grad()
             loss_critic.backward()
             opt_critic.step()
 
-        # ------------------------------------------------------------------
-        # Step 2: Train Generator
-        #
-        # Generator loss = -E[D(G(z))]
-        # Generator wants the critic to score its outputs as HIGH as possible
-        # ------------------------------------------------------------------
+        # ---- Train Generator ----
         noise        = torch.randn(cur_batch, Z_DIM, 1, 1, device=device)
         fake         = gen(noise)
         score_fake_g = critic(fake)
@@ -362,47 +287,71 @@ for epoch in range(1, NUM_EPOCHS + 1):
         loss_gen.backward()
         opt_gen.step()
 
-    # ----------------------------------------------------------------------
-    # Logging
-    # ----------------------------------------------------------------------
     print(
         f"Epoch [{epoch:>3}/{NUM_EPOCHS}] | "
         f"Critic Loss: {loss_critic.item():>9.4f} | "
         f"Gen Loss: {loss_gen.item():>9.4f}"
     )
 
-    # ----------------------------------------------------------------------
-    # Save generated image grid using fixed noise
-    # ----------------------------------------------------------------------
+    # Save loss to CSV every epoch — use this for visualizations later
+    with open(LOSS_LOG, "a", newline="") as f:
+        csv.writer(f).writerow([epoch, round(loss_critic.item(), 6), round(loss_gen.item(), 6)])
+
+    # Save image grid
     if epoch % SAVE_EVERY == 0:
         gen.eval()
         with torch.no_grad():
             samples = gen(fixed_noise)
-        save_image(
-            samples,
-            f"generated/epoch_{epoch:03d}.png",
-            normalize=True,  # Rescale [-1,1] → [0,1] for saving
-            nrow=4
-        )
+        save_image(samples, f"generated/epoch_{epoch:03d}.png", normalize=True, nrow=4)
         gen.train()
         print(f"  → Saved generated/epoch_{epoch:03d}.png")
+
+    # Save checkpoint every 25 epochs
+    if epoch % 25 == 0:
+        torch.save({
+            "epoch"              : epoch,
+            "gen_state_dict"     : gen.state_dict(),
+            "critic_state_dict"  : critic.state_dict(),
+            "opt_gen"            : opt_gen.state_dict(),
+            "opt_critic"         : opt_critic.state_dict(),
+            "z_dim"              : Z_DIM,
+            "img_size"           : IMG_SIZE,
+            "img_channels"       : IMG_CHANNELS,
+            "features_g"         : FEATURES_G,
+            "features_d"         : FEATURES_D,
+        }, f"saved_models/checkpoint_epoch_{epoch:03d}.pt")
+        print(f"  → Checkpoint saved: saved_models/checkpoint_epoch_{epoch:03d}.pt")
 
 print("\nTraining Finished ✓\n")
 
 # =============================================================================
-# 9. EVALUATION
-#
-# Uses the HELD-OUT eval split (not seen during training) for a clean test.
-#
-# Metrics:
-#   Mean real score  — should be positive / higher
-#   Mean fake score  — should be negative / lower
-#   Separation       — larger gap = stronger critic
-#
-# Interpretation guide:
-#   Separation > 50   → Strong critic
-#   Separation 20–50  → Moderate
-#   Separation < 20   → Weak (more training needed)
+# 9. SAVE FINAL MODEL
+#    Saves everything needed to reload and run inference later.
+#    mean_real and mean_fake are placeholders — updated after evaluation below.
+# =============================================================================
+
+def save_final_model(mean_real=None, mean_fake=None):
+    torch.save({
+        "gen_state_dict"    : gen.state_dict(),
+        "critic_state_dict" : critic.state_dict(),
+        "z_dim"             : Z_DIM,
+        "img_size"          : IMG_SIZE,
+        "img_channels"      : IMG_CHANNELS,
+        "features_g"        : FEATURES_G,
+        "features_d"        : FEATURES_D,
+        "num_epochs"        : NUM_EPOCHS,
+        # Threshold info — used by predict.py to classify images
+        "mean_real_score"   : mean_real,
+        "mean_fake_score"   : mean_fake,
+        "threshold"         : ((mean_real + mean_fake) / 2) if (mean_real and mean_fake) else None,
+    }, "saved_models/Trial4_GAN_Model_5class.pt")
+    print("✓ Final model saved → saved_models/Trial4_GAN_Model_5class.pt")
+
+# Save once now (without threshold — before eval)
+save_final_model()
+
+# =============================================================================
+# 10. EVALUATION
 # =============================================================================
 
 print("=" * 60)
@@ -421,11 +370,9 @@ with torch.no_grad():
         real_batch = real_batch.to(device)
         cur        = real_batch.size(0)
 
-        # Real scores
         r_scores = critic(real_batch)
         all_real_scores.append(r_scores)
 
-        # Fake scores
         noise      = torch.randn(cur, Z_DIM, 1, 1, device=device)
         fake_batch = gen(noise)
         f_scores   = critic(fake_batch)
@@ -438,7 +385,6 @@ sep       = mean_real - mean_fake
 print(f"\nMean Critic Score — Real images : {mean_real:+.4f}")
 print(f"Mean Critic Score — Fake images : {mean_fake:+.4f}")
 print(f"Separation (real - fake)        : {sep:+.4f}")
-print()
 
 if sep > 50:
     verdict = "Strong ✓ — Critic clearly distinguishes real from fake."
@@ -447,5 +393,16 @@ elif sep > 20:
 else:
     verdict = "Weak — Try more epochs, larger FEATURES_D, or higher CRITIC_ITERS."
 
-print(f"Assessment: {verdict}")
+print(f"\nAssessment: {verdict}")
 print("=" * 60)
+
+# =============================================================================
+# 11. RESAVE FINAL MODEL WITH THRESHOLD
+#     Now that we have real eval scores, resave with the correct threshold
+#     baked in — predict.py will use this automatically.
+# =============================================================================
+
+save_final_model(mean_real=mean_real, mean_fake=mean_fake)
+print(f"\nThreshold saved in model: {(mean_real + mean_fake) / 2:.4f}")
+print("Model: saved_models/Trial4_GAN_Model_5class.pt")
+print("Run predict.py to classify new images using this model.\n")
